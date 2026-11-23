@@ -1,5 +1,12 @@
 # `errors`
 
+[![License Apache 2](https://img.shields.io/badge/License-Apache2-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
+[![Go](https://img.shields.io/badge/Go-1.24.3+-00ADD8?logo=go&logoColor=white)](https://go.dev/)
+[![Reference](https://pkg.go.dev/badge/github.com/microbus-io/errors)](https://pkg.go.dev/github.com/microbus-io/errors)
+[![Test](https://github.com/microbus-io/errors/actions/workflows/test.yaml/badge.svg?branch=main&event=push)](https://github.com/microbus-io/errors/actions/workflows/test.yaml)
+[![Vulnerabilities](https://github.com/microbus-io/errors/actions/workflows/vulncheck.yaml/badge.svg?branch=main&event=push)](https://github.com/microbus-io/errors/actions/workflows/vulncheck.yaml)
+[![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/FAJHnGkNqJ)
+
 The `errors` module augments Go's standard `errors` package to capture stack traces and associate HTTP status codes and arbitrary properties with errors. For this purpose, it overrides and extends the standard `errors.New` constructor.
 
 ```go

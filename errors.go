@@ -19,6 +19,8 @@ package errors
 import (
 	stderrors "errors"
 	"fmt"
+	"maps"
+	"reflect"
 )
 
 var statusText = map[int]string{
@@ -97,8 +99,11 @@ func Is(err, target error) bool {
 	return stderrors.Is(err, target)
 }
 
-// Join aggregates multiple errors into one.
-// The stack traces of the original errors are discarded and a new stack trace is captured.
+// Join aggregates multiple errors into one and captures a new stack trace.
+// If more than one of the errors is not nil, their status codes, trace IDs, properties and stack traces are discarded
+// and the joined error has status code 500.
+// If only one of the errors is not nil, it is traced as if with Trace, keeping its status code, trace ID, properties and
+// stack trace.
 func Join(errs ...error) error {
 	var err error
 	var n int
@@ -112,9 +117,9 @@ func Join(errs ...error) error {
 	case 0:
 		return nil
 	case 1:
-		return traceCaller(err)
+		return Trace(err)
 	default:
-		return traceCaller(stderrors.Join(errs...))
+		return traceCaller(&TracedError{Err: stderrors.Join(errs...), StatusCode: 500})
 	}
 }
 
@@ -133,22 +138,79 @@ func Trace(err error, a ...any) error {
 }
 
 // Convert converts an error to one that supports stack tracing.
-// If the error already supports this, it is returned as it is.
+// If the error already supports this, it is returned as it is, unless its status code is 0, in which case it is wrapped
+// as described below so that the original is not modified.
+// If the error wraps a TracedError further down its chain, such as one wrapped by another package's error type, it is
+// converted to a new TracedError that wraps it and inherits the status code, trace ID, properties and stack trace of that
+// TracedError. Only errors that wrap a single error are looked into. A chain that branches into more than one error, as
+// errors.Join or fmt.Errorf with several %w can create, has no single TracedError to inherit from.
+// Any other error, including a nil *TracedError held in a non-nil error, is converted to a new TracedError with status
+// code 500.
 // Note: Trace should be called to include the error's trace in the stack.
 func Convert(err error) *TracedError {
 	if err == nil {
 		return nil
 	}
-	if tracedErr, ok := err.(*TracedError); ok {
-		if tracedErr.StatusCode == 0 {
-			tracedErr.StatusCode = 500
-		}
+	if tracedErr, ok := err.(*TracedError); ok && tracedErr != nil && tracedErr.StatusCode != 0 {
 		return tracedErr
 	}
-	return &TracedError{
+	return wrap(err)
+}
+
+// wrap returns a new TracedError that wraps err.
+// It inherits the status code, trace ID, properties and stack trace of the TracedError that findTraced finds in err's
+// chain, if any, without sharing its properties or stack trace. The status code defaults to 500.
+func wrap(err error) *TracedError {
+	tracedErr := &TracedError{
 		Err:        err,
 		StatusCode: 500,
 	}
+	if inner := findTraced(err); inner != nil {
+		if inner.StatusCode != 0 {
+			tracedErr.StatusCode = inner.StatusCode
+		}
+		tracedErr.Trace = inner.Trace
+		tracedErr.Properties = maps.Clone(inner.Properties)
+		tracedErr.Stack = cloneStack(inner.Stack)
+	}
+	return tracedErr
+}
+
+// findTraced returns the TracedError at or below err in its chain of wrapped errors, or nil if there is none.
+// Unlike As, it only looks into errors that wrap a single error. A chain that branches into more than one error, as
+// errors.Join or fmt.Errorf with several %w can create, has no single TracedError to speak for it, so nil is returned.
+// A nil pointer, such as a nil *url.Error, ends the chain, because its methods may not be safe to call.
+func findTraced(err error) *TracedError {
+	for err != nil && !isNilPointer(err) {
+		switch x := err.(type) {
+		case *TracedError:
+			return x
+		case interface{ As(any) bool }:
+			var tracedErr *TracedError
+			if x.As(&tracedErr) && tracedErr != nil {
+				return tracedErr
+			}
+		}
+		switch x := err.(type) {
+		case interface{ Unwrap() error }:
+			err = x.Unwrap()
+		case interface{ Unwrap() []error }:
+			errs := x.Unwrap()
+			if len(errs) != 1 {
+				return nil
+			}
+			err = errs[0]
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
+// isNilPointer reports whether err holds a nil pointer, as in a nil *url.Error returned as an error.
+func isNilPointer(err error) bool {
+	v := reflect.ValueOf(err)
+	return v.Kind() == reflect.Pointer && v.IsNil()
 }
 
 // StatusCode returns the HTTP status code associated with an error.
@@ -177,7 +239,8 @@ func CatchPanic(f func() error) (err error) {
 			} else {
 				err = fmt.Errorf("%v", r)
 			}
-			err = traceFull(err, 1)
+			// Wrap the error so that a shared error, such as a sentinel, is not modified
+			err = traceFull(wrap(err), 1)
 		}
 	}()
 	err = f()

@@ -17,11 +17,15 @@ limitations under the License.
 package errors
 
 import (
+	"encoding/json"
 	stderrors "errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -186,6 +190,58 @@ func TestErrors_Trace(t *testing.T) {
 	assertNil(t, stdErr)
 }
 
+func TestErrors_TraceNested(t *testing.T) {
+	t.Parallel()
+
+	inner := New("connection refused", http.StatusForbidden, "0123456789abcdef0123456789abcdef", "host", "10.0.0.1")
+	wrapped := &url.Error{Op: "Get", URL: "http://10.0.0.1", Err: &net.OpError{Op: "dial", Net: "tcp", Err: inner}}
+
+	// Converting the wrapper inherits the inner error's data and keeps the wrapper's message
+	converted := Convert(wrapped)
+	assertEqual(t, wrapped.Error(), converted.Error())
+	assertEqual(t, http.StatusForbidden, converted.StatusCode)
+	assertEqual(t, http.StatusForbidden, StatusCode(wrapped))
+	assertEqual(t, "0123456789abcdef0123456789abcdef", converted.Trace)
+	assertEqual(t, "10.0.0.1", converted.Properties["host"])
+	assertEqual(t, inner.(*TracedError).Stack, converted.Stack)
+	assertTrue(t, Is(converted, inner))
+
+	// Tracing the wrapper extends the inner error's stack with the current location
+	err := Trace(wrapped)
+	tracedErr := Convert(err)
+	assertEqual(t, wrapped.Error(), tracedErr.Error())
+	assertEqual(t, http.StatusForbidden, tracedErr.StatusCode)
+	assertEqual(t, "0123456789abcdef0123456789abcdef", tracedErr.Trace)
+	assertEqual(t, "10.0.0.1", tracedErr.Properties["host"])
+	assertEqual(t, 2, len(tracedErr.Stack))
+	assertEqual(t, inner.(*TracedError).Stack[0], tracedErr.Stack[0])
+	assertContains(t, tracedErr.Stack[1].Function, "TestErrors_TraceNested")
+	assertEqual(t, 1, len(inner.(*TracedError).Stack))
+	assertTrue(t, Is(err, inner))
+
+	// A status code given to Trace overrides the inherited one
+	assertEqual(t, http.StatusNotFound, StatusCode(Trace(wrapped, http.StatusNotFound)))
+
+	// Wrapping with fmt.Errorf keeps the status code too
+	assertEqual(t, http.StatusForbidden, StatusCode(fmt.Errorf("fetching: %w", inner)))
+}
+
+func TestErrors_TraceDoesNotShareStacks(t *testing.T) {
+	t.Parallel()
+
+	err := New("base")
+	err = Trace(err)
+	err = Trace(err) // The stack now has spare capacity
+	a := Trace(err)
+	b := Trace(err)
+	stackA := Convert(a).Stack
+	stackB := Convert(b).Stack
+	assertEqual(t, 4, len(stackA))
+	assertEqual(t, 4, len(stackB))
+	assertNotEqual(t, stackA[3].Line, stackB[3].Line)
+	assertEqual(t, 3, len(Convert(err).Stack))
+}
+
 func TestErrors_Convert(t *testing.T) {
 	t.Parallel()
 
@@ -275,7 +331,307 @@ func TestErrors_Join(t *testing.T) {
 	}
 
 	assertNil(t, Join(nil, nil))
-	assertEqual(t, e3, Join(e3, nil))
+
+	// A single error is traced as if with Trace, without modifying it
+	j1 := Join(e3, nil)
+	assertTrue(t, Is(j1, e3))
+	assertEqual(t, e3.Error(), j1.Error())
+	assertEqual(t, 3, len(Convert(j1).Stack))
+	assertEqual(t, 2, len(Convert(e3).Stack))
+	assertEqual(t, 400, StatusCode(Join(nil, e2)))
+}
+
+func TestErrors_MultiUnwrapNotInherited(t *testing.T) {
+	t.Parallel()
+
+	a := New("a", http.StatusNotFound, "0123456789abcdef0123456789abcdef", "k", "a")
+	b := New("b", http.StatusServiceUnavailable)
+
+	// No single TracedError speaks for an error that branches into several, so nothing is inherited
+	for _, err := range []error{stderrors.Join(a, b), fmt.Errorf("%w; %w", a, b)} {
+		assertEqual(t, 500, StatusCode(err))
+		converted := Convert(err)
+		assertEqual(t, "", converted.Trace)
+		assertEqual(t, 0, len(converted.Properties))
+		assertEqual(t, 0, len(converted.Stack))
+		traced := Convert(Trace(err))
+		assertEqual(t, 500, traced.StatusCode)
+		assertEqual(t, 1, len(traced.Stack))
+		assertEqual(t, 500, StatusCode(New("", err)))
+		assertTrue(t, Is(err, a))
+		assertTrue(t, Is(err, b))
+	}
+
+	// A single-error wrapper around a branching error is not looked into either
+	assertEqual(t, 500, StatusCode(fmt.Errorf("wrapped: %w", stderrors.Join(a, b))))
+}
+
+func TestErrors_TypedNilInChain(t *testing.T) {
+	t.Parallel()
+
+	var nilTracedErr *TracedError
+	w := fmt.Errorf("w: %w", error(nilTracedErr))
+	assertEqual(t, 500, StatusCode(w))
+	assertEqual(t, 0, len(Convert(w).Stack))
+	traced := Convert(Trace(w))
+	assertEqual(t, 500, traced.StatusCode)
+	assertEqual(t, 1, len(traced.Stack))
+	assertEqual(t, 500, StatusCode(New("failed", w)))
+	assertEqual(t, 500, StatusCode(New("failed: %w", w)))
+	assertTrue(t, !Is(Trace(w), os.ErrNotExist))
+}
+
+func TestErrors_TypedNil(t *testing.T) {
+	t.Parallel()
+
+	var nilTracedErr *TracedError
+	var err error = nilTracedErr
+
+	converted := Convert(err)
+	assertEqual(t, 500, converted.StatusCode)
+	assertEqual(t, "<nil>", converted.Error())
+	assertEqual(t, 0, len(converted.Stack))
+	assertContains(t, fmt.Sprintf("%+v", converted), "<nil>")
+	assertEqual(t, 500, StatusCode(err))
+
+	traced := Trace(err)
+	assertEqual(t, "<nil>", traced.Error())
+	assertEqual(t, 1, len(Convert(traced).Stack))
+	assertNil(t, Unwrap(traced)) // The nil pointer is not exposed to Is and As
+	assertTrue(t, !Is(traced, os.ErrNotExist))
+
+	assertEqual(t, "<nil>", Join(err, nil).Error())
+	assertEqual(t, "failed: <nil>", New("failed", err).Error())
+	caught := CatchPanic(func() error {
+		panic(err)
+	})
+	assertEqual(t, "<nil>", caught.Error())
+	assertEqual(t, 500, StatusCode(caught))
+}
+
+func TestErrors_NilPointerCause(t *testing.T) {
+	t.Parallel()
+
+	var nilURLErr *url.Error
+	var err error = nilURLErr
+
+	caught := CatchPanic(func() error {
+		panic(err)
+	})
+	assertEqual(t, "<nil>", caught.Error())
+	assertEqual(t, 500, StatusCode(caught))
+	assertTrue(t, !Is(caught, os.ErrNotExist))
+	var urlErr *url.Error
+	assertTrue(t, !As(caught, &urlErr))
+	_, jsonErr := json.Marshal(caught)
+	assertNil(t, jsonErr)
+
+	assertEqual(t, 500, StatusCode(err))
+	assertEqual(t, "<nil>", Convert(err).Error())
+	assertEqual(t, "<nil>", Trace(err).Error())
+	assertEqual(t, "failed: <nil>", New("failed", err).Error())
+	assertEqual(t, 500, StatusCode(fmt.Errorf("wrapped: %w", err)))
+}
+
+func TestErrors_SingleErrorJoin(t *testing.T) {
+	t.Parallel()
+
+	a := New("a", http.StatusNotFound, "k", "v")
+	for _, err := range []error{stderrors.Join(a, nil), stderrors.Join(nil, a), fmt.Errorf("%w %w", a, nil)} {
+		assertEqual(t, http.StatusNotFound, StatusCode(err))
+		assertEqual(t, "v", Convert(err).Properties["k"])
+		assertEqual(t, http.StatusNotFound, StatusCode(Trace(err)))
+	}
+}
+
+func TestErrors_FormatVerbs(t *testing.T) {
+	t.Parallel()
+
+	stdErr := stderrors.New("boom")
+	tracedErr := Trace(stdErr)
+
+	// A traced error formats its message like a standard error does
+	for _, f := range []string{"%v", "%s", "%q", "%x", "%X", "%10s", "%-10s|", "%.2s", "%+q", "%#q"} {
+		assertEqual(t, fmt.Sprintf(f, stdErr), fmt.Sprintf(f, tracedErr))
+	}
+
+	// New lets these verbs format an error operand instead of treating them as literal text
+	assertEqual(t, "type *errors.errorString", New("type %T", stdErr).Error())
+	assertEqual(t, "hex 626f6f6d", New("hex %x", stdErr).Error())
+	assertEqual(t, `quoted "boom"`, New("quoted %q", tracedErr).Error())
+	assertEqual(t, "type *errors.TracedError", New("type %T", tracedErr).Error())
+
+	// A directive that becomes literal text gives back the args it took, such as a * width
+	err := New("size %*d", http.StatusNotFound, stdErr)
+	assertEqual(t, "size %*d: boom", err.Error())
+	assertEqual(t, http.StatusNotFound, StatusCode(err))
+	assertTrue(t, Is(err, stdErr))
+}
+
+func TestErrors_UnnamedCauseUnwraps(t *testing.T) {
+	t.Parallel()
+
+	cause := stderrors.New("cause")
+	err := New("failed", cause)
+	assertEqual(t, "failed: cause", err.Error())
+	assertEqual(t, cause, Unwrap(Unwrap(err)))
+
+	err = New("", http.StatusBadRequest, cause)
+	assertEqual(t, "bad request: cause", err.Error())
+	assertEqual(t, cause, Unwrap(Unwrap(err)))
+
+	// With more than one cause, each remains reachable through Is
+	other := stderrors.New("other")
+	err = New("failed", cause, other)
+	assertEqual(t, "failed: cause: other", err.Error())
+	assertTrue(t, Is(err, cause))
+	assertTrue(t, Is(err, other))
+}
+
+func TestErrors_StackFramesNotShared(t *testing.T) {
+	t.Parallel()
+
+	original := New("original")
+	originalFile := original.(*TracedError).Stack[0].File
+	for _, derived := range []*TracedError{Convert(Trace(original)), Convert(fmt.Errorf("wrapped: %w", original))} {
+		derived.Stack[0].File = "redacted"
+		assertEqual(t, originalFile, original.(*TracedError).Stack[0].File)
+	}
+}
+
+func TestErrors_NullStackFrame(t *testing.T) {
+	t.Parallel()
+
+	var tracedErr TracedError
+	assertNil(t, json.Unmarshal([]byte(`{"error":"x","stack":[null,{"func":"f","file":"f.go","line":1},null]}`), &tracedErr))
+	assertEqual(t, 1, len(tracedErr.Stack))
+	assertContains(t, tracedErr.String(), "f.go:1")
+
+	// A null frame in a stack built some other way is skipped when rendering
+	tracedErr.Stack = append(tracedErr.Stack, nil)
+	assertContains(t, tracedErr.String(), "f.go:1")
+}
+
+func TestErrors_NewInheritsFromPatternWrap(t *testing.T) {
+	t.Parallel()
+
+	inner := New("x", http.StatusNotFound, "0123456789abcdef0123456789abcdef", "k", "v")
+	err := New("fetch: %w", inner)
+	tracedErr := Convert(err)
+	assertEqual(t, "fetch: x", err.Error())
+	assertEqual(t, http.StatusNotFound, tracedErr.StatusCode)
+	assertEqual(t, "0123456789abcdef0123456789abcdef", tracedErr.Trace)
+	assertEqual(t, "v", tracedErr.Properties["k"])
+	assertEqual(t, 2, len(tracedErr.Stack))
+	assertEqual(t, inner.(*TracedError).Stack[0], tracedErr.Stack[0])
+	assertEqual(t, 1, len(inner.(*TracedError).Stack))
+	assertTrue(t, Is(err, inner))
+	assertEqual(t, StatusCode(fmt.Errorf("fetch: %w", inner)), StatusCode(err))
+
+	// An explicit status code takes precedence
+	assertEqual(t, http.StatusBadGateway, StatusCode(New("fetch: %w", inner, http.StatusBadGateway)))
+
+	// %v prints the error without wrapping it, so nothing is inherited
+	err = New("fetch: %v", inner)
+	assertEqual(t, "fetch: x", err.Error())
+	assertEqual(t, 500, StatusCode(err))
+	assertTrue(t, !Is(err, inner))
+}
+
+func TestErrors_NewInheritsFromFirstError(t *testing.T) {
+	t.Parallel()
+
+	a := New("a", http.StatusNotFound, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "k", "a", "onlyA", 1)
+	b := New("b", http.StatusServiceUnavailable, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "k", "b", "onlyB", 2)
+	for _, err := range []error{New("x", a, b), New("x: %w", a, b), New("%w: %w", a, b)} {
+		tracedErr := Convert(err)
+		assertEqual(t, http.StatusNotFound, tracedErr.StatusCode)
+		assertEqual(t, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", tracedErr.Trace)
+		assertEqual(t, 2, len(tracedErr.Stack))
+		assertEqual(t, a.(*TracedError).Stack[0], tracedErr.Stack[0])
+		assertEqual(t, "a", tracedErr.Properties["k"])
+		assertEqual(t, 1, tracedErr.Properties["onlyA"])
+		assertEqual(t, 2, tracedErr.Properties["onlyB"])
+	}
+
+	// Explicit arguments take precedence regardless of their order
+	tracedErr := Convert(New("x", "k", "explicit", http.StatusConflict, "cccccccccccccccccccccccccccccccc", a))
+	assertEqual(t, http.StatusConflict, tracedErr.StatusCode)
+	assertEqual(t, "cccccccccccccccccccccccccccccccc", tracedErr.Trace)
+	assertEqual(t, "explicit", tracedErr.Properties["k"])
+	assertEqual(t, 1, tracedErr.Properties["onlyA"])
+}
+
+func TestErrors_LiteralPercent(t *testing.T) {
+	t.Parallel()
+
+	inner := New("x", http.StatusNotFound)
+
+	// A % sign that cannot format the error is literal text and the error is wrapped
+	err := New("100% done", inner)
+	assertEqual(t, "100% done: x", err.Error())
+	assertTrue(t, Is(err, inner))
+	assertEqual(t, http.StatusNotFound, StatusCode(err))
+
+	err = New("%d%% done, 100% left", 5, inner)
+	assertEqual(t, "5% done, 100% left: x", err.Error())
+	assertTrue(t, Is(err, inner))
+
+	// A trailing % sign is literal text
+	assertEqual(t, "progress: 100%", New("progress: 100%").Error())
+	assertEqual(t, "progress: 100%: x", New("progress: 100%", inner).Error())
+
+	// Verbs that can print an error still consume it
+	assertEqual(t, "failed: x", New("failed: %s", inner).Error())
+
+	// Argument indexes, widths and precisions are parsed as fmt does
+	err = New("%[2]s %[1]s", "a", "b", http.StatusBadRequest)
+	assertEqual(t, "b a", err.Error())
+	assertEqual(t, http.StatusBadRequest, StatusCode(err))
+	err = New("[%*d] [%-5.2f]", 4, 7, 3.14159, http.StatusBadRequest)
+	assertEqual(t, "[   7] [3.14 ]", err.Error())
+	assertEqual(t, http.StatusBadRequest, StatusCode(err))
+}
+
+func TestErrors_SharedErrorNotModified(t *testing.T) {
+	t.Parallel()
+
+	sentinel := New("not found", http.StatusNotFound)
+	stackLen := len(sentinel.(*TracedError).Stack)
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			j := Join(sentinel, nil)
+			assertTrue(t, Is(j, sentinel))
+			assertEqual(t, http.StatusNotFound, StatusCode(j))
+			assertEqual(t, stackLen+1, len(Convert(j).Stack))
+
+			caught := CatchPanic(func() error {
+				panic(sentinel)
+			})
+			assertTrue(t, Is(caught, sentinel))
+			assertEqual(t, http.StatusNotFound, StatusCode(caught))
+			assertTrue(t, len(Convert(caught).Stack) > stackLen)
+		}()
+	}
+	wg.Wait()
+	assertEqual(t, stackLen, len(sentinel.(*TracedError).Stack))
+
+	// Converting an error with no status code does not write the default into it
+	noStatus := &TracedError{Err: stderrors.New("no status")}
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			assertEqual(t, 500, StatusCode(noStatus))
+			assertTrue(t, Is(Convert(noStatus), noStatus))
+		}()
+	}
+	wg.Wait()
+	assertEqual(t, 0, noStatus.StatusCode)
 }
 
 func TestErrors_String(t *testing.T) {

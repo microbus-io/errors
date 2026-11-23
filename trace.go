@@ -17,29 +17,68 @@ limitations under the License.
 package errors
 
 import (
+	"reflect"
 	"runtime"
 	"strings"
 )
 
+// pkgPath is the import path of this package, such as github.com/microbus-io/errors.
+var pkgPath = reflect.TypeFor[TracedError]().PkgPath()
+
+// isInternalFrame reports whether a function, given by its full name, belongs to the runtime or to this package, other
+// than to its tests. Its frames are left out of stack traces.
+// The full name is required so that functions of other packages that happen to be named errors are not left out too.
+func isInternalFrame(function string) bool {
+	if strings.HasPrefix(function, "runtime.") {
+		return true
+	}
+	rest, ok := strings.CutPrefix(function, pkgPath+".")
+	return ok && !strings.HasPrefix(rest, "Test")
+}
+
+// shortFunctionName removes the package path from a function's full name, leaving the package name.
+func shortFunctionName(function string) string {
+	if p := strings.LastIndex(function, "/"); p >= 0 {
+		return function[p+1:]
+	}
+	return function
+}
+
+// cloneStack returns a copy of the stack trace whose frames can be modified without affecting the original.
+func cloneStack(stack []*StackFrame) []*StackFrame {
+	if stack == nil {
+		return nil
+	}
+	frames := make([]StackFrame, len(stack)) // One allocation for all frames
+	clone := make([]*StackFrame, len(stack))
+	for i, frame := range stack {
+		if frame != nil {
+			frames[i] = *frame
+			clone[i] = &frames[i]
+		}
+	}
+	return clone
+}
+
 // traceCaller appends the stack location of the caller to the error's stack trace.
-func traceCaller(err error) error {
-	if err == nil {
+// The error is modified in place, so the caller must own it rather than share it.
+func traceCaller(tracedErr *TracedError) error {
+	if tracedErr == nil {
 		return nil
 	}
 	level := 1
-	tracedErr := Convert(err)
 	for {
 		file, function, line, ok := runtimeTrace(level)
 		if !ok {
 			return tracedErr
 		}
-		if strings.HasPrefix(function, "runtime.") || (strings.HasPrefix(function, "errors.") && !strings.HasPrefix(function, "errors.Test")) {
+		if isInternalFrame(function) {
 			level++
 			continue
 		}
 		tracedErr.Stack = append(tracedErr.Stack, &StackFrame{
 			File:     file,
-			Function: function,
+			Function: shortFunctionName(function),
 			Line:     line,
 		})
 		return tracedErr
@@ -48,14 +87,14 @@ func traceCaller(err error) error {
 
 // traceFull appends the full stack to the error's stack trace, starting at the indicated level.
 // Level 0 captures the location of the caller.
-func traceFull(err error, level int) error {
-	if err == nil {
+// The error is modified in place, so the caller must own it rather than share it.
+func traceFull(tracedErr *TracedError, level int) error {
+	if tracedErr == nil {
 		return nil
 	}
 	if level < 0 {
 		level = 0
 	}
-	tracedErr := Convert(err)
 
 	levels := level - 1
 	for {
@@ -64,15 +103,15 @@ func traceFull(err error, level int) error {
 		if !ok {
 			break
 		}
-		if function == "errors.CatchPanic" {
+		if function == pkgPath+".CatchPanic" {
 			break
 		}
-		if strings.HasPrefix(function, "runtime.") || (strings.HasPrefix(function, "errors.") && !strings.HasPrefix(function, "errors.Test")) {
+		if isInternalFrame(function) {
 			continue
 		}
 		tracedErr.Stack = append(tracedErr.Stack, &StackFrame{
 			File:     file,
-			Function: function,
+			Function: shortFunctionName(function),
 			Line:     line,
 		})
 	}
@@ -80,6 +119,7 @@ func traceFull(err error, level int) error {
 }
 
 // runtimeTrace traces back by the amount of levels to retrieve the runtime information used for tracing.
+// The function is identified by its full name, including its package path.
 func runtimeTrace(levels int) (file string, function string, line int, ok bool) {
 	pc, file, line, ok := runtime.Caller(levels + 1)
 	if !ok {
@@ -89,10 +129,6 @@ func runtimeTrace(levels int) (file string, function string, line int, ok bool) 
 	runtimeFunc := runtime.FuncForPC(pc)
 	if runtimeFunc != nil {
 		function = runtimeFunc.Name()
-		p := strings.LastIndex(function, "/")
-		if p >= 0 {
-			function = function[p+1:]
-		}
 	}
 	return file, function, line, ok
 }

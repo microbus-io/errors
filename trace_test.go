@@ -27,7 +27,7 @@ func TestErrors_RuntimeTrace(t *testing.T) {
 	file, function, line1, _ := runtimeTrace(0)
 	_, _, line2, _ := runtimeTrace(0)
 	assertContains(t, file, "trace_test.go")
-	assertEqual(t, "errors.TestErrors_RuntimeTrace", function)
+	assertEqual(t, "github.com/microbus-io/errors.TestErrors_RuntimeTrace", function)
 	assertEqual(t, line1+1, line2)
 }
 
@@ -36,7 +36,7 @@ func TestErrors_TraceFull(t *testing.T) {
 
 	stdErr := stderrors.New("Oops")
 	err := Trace(stdErr)
-	errFull := traceFull(stdErr, 0)
+	errFull := traceFull(Convert(stdErr), 0)
 
 	tracedErr := Convert(err)
 	assertEqual(t, 1, len(tracedErr.Stack))
@@ -50,6 +50,24 @@ func TestErrors_TraceCaller(t *testing.T) {
 	t.Parallel()
 
 	err := stderrors.New("hello")
-	err0 := traceCaller(err)
+	err0 := traceCaller(Convert(err))
 	assertEqual(t, "errors.TestErrors_TraceCaller", Convert(err0).Stack[0].Function)
+}
+
+func TestErrors_InternalFrame(t *testing.T) {
+	t.Parallel()
+
+	assertTrue(t, isInternalFrame("runtime.gopanic"))
+	assertTrue(t, isInternalFrame("github.com/microbus-io/errors.New"))
+	assertTrue(t, isInternalFrame("github.com/microbus-io/errors.CatchPanic.func1"))
+	assertTrue(t, isInternalFrame("github.com/microbus-io/errors.(*TracedError).Format"))
+	assertTrue(t, !isInternalFrame("github.com/microbus-io/errors.TestErrors_InternalFrame"))
+
+	// Functions of other packages named errors are not left out
+	assertTrue(t, !isInternalFrame("example.com/app/errors.Wrap"))
+	assertTrue(t, !isInternalFrame("errors.New"))
+	assertTrue(t, !isInternalFrame("example.com/app/runtime.Start"))
+
+	assertEqual(t, "errors.New", shortFunctionName("github.com/microbus-io/errors.New"))
+	assertEqual(t, "main.main", shortFunctionName("main.main"))
 }
